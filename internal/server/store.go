@@ -738,10 +738,15 @@ func (s *Store) GetRelated(uri string, predicate string, inverse bool, datasets 
 	return s.GetRelatedAtTime(uri, predicate, inverse, targetDatasetIds, queryTime)
 }
 
+
+
+func (s *Store) ForRelatedAtTime(uri string, predicate string, inverse bool, targetDatasetIds []uint32, queryTime int64, from []byte, take int, callback func([]result, []byte)) error {
+	return nil
+}
+
 func (s *Store) GetRelatedAtTime(uri string, predicate string, inverse bool, targetDatasetIds []uint32, queryTime int64) ([]result, error) {
 	var resourceCurie, predCurie string
 	var err error
-
 	if strings.HasPrefix(uri, "ns") {
 		resourceCurie = uri
 	} else {
