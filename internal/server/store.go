@@ -738,9 +738,252 @@ func (s *Store) GetRelated(uri string, predicate string, inverse bool, datasets 
 	return s.GetRelatedAtTime(uri, predicate, inverse, targetDatasetIds, queryTime)
 }
 
+func (s *Store) ForRelatedAtTime(
+	uri string,
+	predicate string,
+	inverse bool,
+	targetDatasetIds []uint32,
+	queryTime int64,
+	from []byte,
+	take int,
+	callback func([]result, []byte)) error {
 
+	var resourceCurie, predCurie string
+	var err error
+	if strings.HasPrefix(uri, "ns") {
+		resourceCurie = uri
+	} else {
+		resourceCurie, err = s.GetNamespacedIdentifierFromUri(uri)
+		if err != nil {
+			return err
+		}
+	}
 
-func (s *Store) ForRelatedAtTime(uri string, predicate string, inverse bool, targetDatasetIds []uint32, queryTime int64, from []byte, take int, callback func([]result, []byte)) error {
+	if predicate != "*" {
+		if strings.HasPrefix(predicate, "ns") {
+			predCurie = predicate
+		} else {
+			predCurie, err = s.GetNamespacedIdentifierFromUri(predicate)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	results := make([]result, 0)
+	taken := 0
+
+	// lookup pred and id
+	err = s.database.View(func(txn *badger.Txn) error {
+
+		rid, ridExists, err := s.getIDForURI(txn, resourceCurie)
+		if err != nil {
+			return err
+		}
+		if !ridExists {
+			return nil
+		}
+
+		var pid uint64
+		var pidExists bool
+		if predicate != "*" {
+			pid, pidExists, err = s.getIDForURI(txn, predCurie)
+			if err != nil {
+				return err
+			}
+
+			if !pidExists {
+				return nil
+			}
+		}
+
+		if inverse {
+			// define search prefix
+			searchBuffer := make([]byte, 10)
+			binary.BigEndian.PutUint16(searchBuffer, INCOMING_REF_INDEX)
+			binary.BigEndian.PutUint64(searchBuffer[2:], rid)
+
+			opts1 := badger.DefaultIteratorOptions
+			opts1.PrefetchValues = false
+			opts1.Prefix = searchBuffer
+			// opts1.Reverse = true
+			outgoingIterator := txn.NewIterator(opts1)
+			defer outgoingIterator.Close()
+
+			var currentRID uint64
+			currentRID = 0
+			tmpResult := make(map[[46]byte]result)
+			tmpResultCount := 0
+
+			for outgoingIterator.Seek(searchBuffer); outgoingIterator.ValidForPrefix(searchBuffer); outgoingIterator.Next() {
+				item := outgoingIterator.Item()
+				k := item.Key()
+
+				// check dataset if deleted, or if excluded from search
+				datasetId := binary.BigEndian.Uint32(k[36:])
+
+				datasetIncluded := len(targetDatasetIds) == 0 // no specified datasets means no restriction - all datasets are allowed
+				if !datasetIncluded {
+					for _, id := range targetDatasetIds {
+						if id == datasetId {
+							datasetIncluded = true
+							break
+						}
+					}
+				}
+
+				if s.deletedDatasets[datasetId] || !datasetIncluded {
+					continue
+				}
+
+				// get recorded time on relationship
+				// if rel recorded time gt than query time then continue
+				et := int64(binary.BigEndian.Uint64(k[18:]))
+				if et > queryTime {
+					continue
+				}
+
+				// get related
+				relatedID := binary.BigEndian.Uint64(k[10:])
+
+				if relatedID != currentRID {
+					// add to results
+					if currentRID != 0 {
+						for _, v := range tmpResult {
+
+							if taken <= take {
+								callback(tmpResult[0..tmpResultCount], k)
+							}
+
+							newTmpResult := &tmpResultRecord{key: k, result: v}
+							if tempResultHead == nil {
+								tempResultHead = newTmpResult
+							} else {
+								tempResultHead.next = newTmpResult
+							}
+						}
+					}
+					tmpResult = make(map[[12]byte]result)
+					tempResultHead = nil
+				}
+
+				// set current to be this related object
+				currentRID = relatedID
+
+				// get predicate
+				predID := binary.BigEndian.Uint64(k[26:])
+				if pid != predID && predicate != "*" {
+					continue
+				}
+
+				// make result key
+				var rkey [12]byte
+				binary.BigEndian.PutUint32(rkey[0:], datasetId)
+				binary.BigEndian.PutUint64(rkey[4:], predID)
+
+				// check is deleted
+				del := binary.BigEndian.Uint16(k[34:])
+				if del == 1 {
+					// remove result from tmp for this
+					delete(tmpResult, rkey)
+				} else {
+					tmpResult[rkey] = result{time: uint64(et), entityID: relatedID, predicateID: predID, datasetID: datasetId}
+				}
+			}
+
+			// add the last batch of pending tmp results
+			if currentRID != 0 {
+				for _, v := range tmpResult {
+					results = append(results, v)
+				}
+			}
+		} else {
+			/*  binary.BigEndian.PutUint16(outgoingBuffer, OUTGOING_REF_INDEX)
+			binary.BigEndian.PutUint64(outgoingBuffer[2:], rid)
+			binary.BigEndian.PutUint64(outgoingBuffer[10:], uint64(txnTime))
+			binary.BigEndian.PutUint64(outgoingBuffer[18:], predid)
+			binary.BigEndian.PutUint64(outgoingBuffer[26:], relatedid)
+			binary.BigEndian.PutUint16(outgoingBuffer[34:], 0) // deleted.
+			binary.BigEndian.PutUint32(outgoingBuffer[36:], ds.InternalID) */
+
+			searchBuffer := make([]byte, 10)
+			binary.BigEndian.PutUint16(searchBuffer, OUTGOING_REF_INDEX)
+			binary.BigEndian.PutUint64(searchBuffer[2:], rid)
+
+			// key is pid, ds, rid
+			tmpResult := make(map[[20]byte]result)
+
+			opts1 := badger.DefaultIteratorOptions
+			opts1.PrefetchValues = false
+			opts1.Prefix = searchBuffer
+			outgoingIterator := txn.NewIterator(opts1)
+			defer outgoingIterator.Close()
+
+			for outgoingIterator.Seek(searchBuffer); outgoingIterator.ValidForPrefix(searchBuffer); outgoingIterator.Next() {
+				item := outgoingIterator.Item()
+				k := item.Key()
+
+				datasetId := binary.BigEndian.Uint32(k[36:])
+
+				datasetIncluded := len(targetDatasetIds) == 0 // no specified datasets means no restriction - all datasets are allowed
+				if !datasetIncluded {
+					for _, id := range targetDatasetIds {
+						if id == datasetId {
+							datasetIncluded = true
+							break
+						}
+					}
+				}
+
+				if s.deletedDatasets[datasetId] || !datasetIncluded {
+					continue
+				}
+
+				// get recorded time on relationship
+				// if rel recorded time gt than query time then continue
+				et := int64(binary.BigEndian.Uint64(k[10:]))
+				if et > queryTime {
+					// we can use break here
+					break
+				}
+
+				// get predicate
+				predID := binary.BigEndian.Uint64(k[18:])
+				if pid != predID && predicate != "*" {
+					continue
+				}
+
+				// get related
+				relatedID := binary.BigEndian.Uint64(k[26:])
+
+				var rkey [20]byte
+				binary.BigEndian.PutUint32(rkey[0:], datasetId)
+				binary.BigEndian.PutUint64(rkey[4:], predID)
+				binary.BigEndian.PutUint64(rkey[12:], relatedID)
+
+				// get deleted
+				del := binary.BigEndian.Uint16(k[34:])
+				if del == 1 {
+					delete(tmpResult, rkey)
+				} else {
+					tmpResult[rkey] = result{time: uint64(et), entityID: relatedID, predicateID: predID}
+				}
+			}
+
+			results = make([]result, len(tmpResult))
+			i := 0
+			for _, v := range tmpResult {
+				results[i] = v
+				i++
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
